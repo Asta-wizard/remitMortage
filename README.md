@@ -84,7 +84,7 @@ RemitMortgage coordinates the entire homeownership journey on-chain through five
 *   **Frontend Dashboard:** Borrower portal for savings tracking, loan status, repayment schedules, and milestone progress visualization.
 
 ## Documentation
-*   [Technical Architecture](ARCHITECTURE.md): Core principle of separating verification from settlement, contract suite design, and end-to-end flow.
+*   [Architecture](ARCHITECTURE.md): Core principle of separating verification from settlement, contract suite design, and end-to-end flow.
 *   [Contributing Guide](CONTRIBUTING.md): How to set up locally, branch conventions, commit standards, and PR guidelines.
 
 ## License
