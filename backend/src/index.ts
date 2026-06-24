@@ -9,6 +9,7 @@ import { verificationRouter } from "./routes/verification.js";
 import { borrowerRouter } from "./routes/borrower.js";
 import { loanRouter } from "./routes/loan.js";
 import { errorHandler } from "./middleware/errorHandler.js";
+import { startNotificationScheduler } from "./services/notification.js";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -41,6 +42,7 @@ app.use(errorHandler);
 // ── Start Server ────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 RemitMortgage API running on http://localhost:${PORT}`);
+  startNotificationScheduler();
 });
 
 export default app;
