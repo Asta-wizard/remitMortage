@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import loadDynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { Calendar, Clock, DollarSign, ArrowRight } from "lucide-react";

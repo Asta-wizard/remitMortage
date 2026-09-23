@@ -9,7 +9,7 @@ const CHECKER = path.resolve(REPO_ROOT, "scripts/check-sri.py");
 
 function runChecker(tmpFrontend: string): { exitCode: number; output: string } {
   try {
-    const out = execSync(`python "${CHECKER}" --frontend "${tmpFrontend}" 2>&1`, {
+    const out = execSync(`python3 "${CHECKER}" --frontend "${tmpFrontend}" 2>&1`, {
       encoding: "utf-8",
       cwd: REPO_ROOT,
     });
@@ -33,7 +33,7 @@ describe("SRI checker (scripts/check-sri.py)", () => {
 
   it("passes on current frontend (no CDN script without SRI)", () => {
     try {
-      execSync(`python "${CHECKER}" --frontend "${FRONTEND_ROOT}" 2>&1`, {
+      execSync(`python3 "${CHECKER}" --frontend "${FRONTEND_ROOT}" 2>&1`, {
         encoding: "utf-8",
         cwd: REPO_ROOT,
       });

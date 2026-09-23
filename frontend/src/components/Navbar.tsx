@@ -51,7 +51,9 @@ function InnerNavbar() {
   const { unreadCount, togglePanel } = useNotifications();
   const { openCheatSheet } = useKeyboardShortcuts();
   const t = useTranslations("nav");
-  const pathname = usePathname();
+  // usePathname() can return null (e.g. outside an active route render), and
+  // every active-link check below does pathname.startsWith(...).
+  const pathname = usePathname() ?? "";
   const [menuOpen, setMenuOpen] = useState(false);
 
   const showDisconnectNotice = !!walletError && !isConnected;

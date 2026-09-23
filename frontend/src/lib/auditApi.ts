@@ -89,10 +89,19 @@ export function filterByDateRange(
   from?: Date,
   to?: Date
 ): AuditLogEntry[] {
+  // `to` is a date picker value (e.g. "2025-01-16", parsed as UTC midnight);
+  // treat it as inclusive of the entire UTC day rather than cutting off at
+  // midnight.
+  const inclusiveTo = to
+    ? new Date(
+        Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate(), 23, 59, 59, 999)
+      )
+    : undefined;
+
   return logs.filter((log) => {
     const date = new Date(log.createdAt);
     if (from && date < from) return false;
-    if (to && date > to) return false;
+    if (inclusiveTo && date > inclusiveTo) return false;
     return true;
   });
 }

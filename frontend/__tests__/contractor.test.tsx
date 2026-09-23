@@ -104,7 +104,7 @@ describe("Contractor Portal Tests", () => {
 
     // Wait for upload to complete
     await waitFor(() => {
-      expect(handleUploadSuccess).toHaveBeenCalledWith(mockCid);
+      expect(handleUploadSuccess).toHaveBeenCalledWith(mockCid, expect.any(String));
     });
 
     // Verify CID is displayed

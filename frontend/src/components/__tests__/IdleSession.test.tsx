@@ -6,7 +6,7 @@ import { IdleSessionProvider, useIdleSession } from "@/context/IdleSessionContex
 
 // Mock WalletContext and ToastContext
 const mockDisconnectAll = jest.fn();
-const mockAddToast = jest.fn();
+const mockToast = jest.fn();
 
 jest.mock("@/context/WalletContext", () => ({
   useWallet: () => ({
@@ -17,7 +17,7 @@ jest.mock("@/context/WalletContext", () => ({
 
 jest.mock("@/context/ToastContext", () => ({
   useToast: () => ({
-    addToast: mockAddToast,
+    toast: mockToast,
   }),
 }));
 
@@ -140,10 +140,12 @@ describe("IdleSessionProvider Logic", () => {
     });
 
     expect(mockDisconnectAll).toHaveBeenCalledTimes(1);
-    expect(mockAddToast).toHaveBeenCalledWith(
-      "Session Expired",
-      expect.stringContaining("logged out automatically"),
-      "warning"
+    expect(mockToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        variant: "warning",
+        title: "Session Expired",
+        message: expect.stringContaining("logged out automatically"),
+      })
     );
   });
 

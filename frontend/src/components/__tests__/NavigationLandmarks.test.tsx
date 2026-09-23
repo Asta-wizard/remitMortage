@@ -63,7 +63,7 @@ describe("Accessible Navigation Landmarks & Skip Links (#485)", () => {
   });
 
   it("renders WithdrawModal with accessible dialog role and title labelling", () => {
-    render(<WithdrawModal isOpen={true} onClose={jest.fn()} />);
+    render(<WithdrawModal isOpen={true} onClose={jest.fn()} deposited="1000" />);
     const dialog = screen.getByRole("dialog");
     expect(dialog).toBeInTheDocument();
     expect(dialog).toHaveAttribute("aria-modal", "true");

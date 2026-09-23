@@ -1,4 +1,4 @@
-import { filterAuditLogs, filterByDateRange, exportToCsv, AuditLogEntry } from "../lib/auditApi";
+import { filterAuditLogs, filterByDateRange, exportToCsv, AuditLogEntry } from "../src/lib/auditApi";
 
 describe("auditApi", () => {
   const sampleLogs: AuditLogEntry[] = [

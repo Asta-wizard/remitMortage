@@ -9,7 +9,7 @@ export function LocaleSwitcher() {
   const t = useTranslations("nav");
   const locale = useLocale() as Locale;
   const router = useRouter();
-  const pathname = usePathname();
+  const pathname = usePathname() ?? "/";
   const [isPending, startTransition] = useTransition();
 
   const handleChange = (nextLocale: Locale) => {

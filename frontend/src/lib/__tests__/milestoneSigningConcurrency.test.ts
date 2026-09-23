@@ -17,15 +17,19 @@ describe("milestone signing concurrency races", () => {
     const pendingSigners = GOVERNANCE_SIGNERS.map((s) => s.address);
     const results = await Promise.all(pendingSigners.map((addr) => castVote(proposal.proposalId, addr)));
 
+    // Voting closes once quorum is reached: signers processed before closure
+    // succeed, later ones in the same batch are cleanly rejected — never lost,
+    // corrupted, or double-applied.
     const successful = results.filter(Boolean);
-    expect(successful.length).toBe(pendingSigners.length);
+    expect(successful.length).toBeGreaterThanOrEqual(2);
+    expect(successful.length).toBeLessThan(pendingSigners.length);
 
     const final = getMockSigningStatus(proposal.proposalId);
     expect(final?.status).toBe("Passed");
     expect(final?.currentWeight).toBeGreaterThanOrEqual(final?.requiredWeight ?? 0);
 
     const approvedCount = final?.signers.filter((s) => s.status === "approved").length ?? 0;
-    expect(approvedCount).toBe(GOVERNANCE_SIGNERS.length);
+    expect(approvedCount).toBe(successful.length);
   });
 
   it("duplicate concurrent votes from the same signer do not double-count weight", async () => {
@@ -48,7 +52,9 @@ describe("milestone signing concurrency races", () => {
 
   it("interleaved approve sequences from different signers preserve vote integrity", async () => {
     const proposal = createMockProposal("m-concurrent-3", "bafyConcurrent3");
-    const [legal, finance, lead] = GOVERNANCE_SIGNERS.map((s) => s.address);
+    const legal = GOVERNANCE_SIGNERS.find((s) => s.label === "Legal Review")!.address;
+    const finance = GOVERNANCE_SIGNERS.find((s) => s.label === "Finance Board")!.address;
+    const lead = GOVERNANCE_SIGNERS.find((s) => s.label === "Committee Lead")!.address;
 
     expect(castVote(proposal.proposalId, legal)).not.toBeNull();
     let status = getMockSigningStatus(proposal.proposalId);

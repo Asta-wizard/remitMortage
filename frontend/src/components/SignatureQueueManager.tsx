@@ -291,7 +291,10 @@ export function SignatureQueueManager({
       )}
 
       {isPassed && !txHash && !isSubmitting && (
-        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3">
+        <div
+          data-testid="quorum-reached-banner"
+          className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3"
+        >
           <p className="flex items-center gap-2 text-sm font-semibold text-emerald-400">
             <ShieldCheck className="h-4 w-4 shrink-0" />
             Quorum reached
