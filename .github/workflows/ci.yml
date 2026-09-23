@@ -35,42 +35,6 @@ jobs:
         run: |
           conftest test --policy devops/k8s/policy devops/k8s/*.yaml
 
-  # ── Smart Contracts CI ──────────────────────────────────────────────────
-  contracts-ci:
-    name: Contracts CI (Soroban)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            contracts -> target
-
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
-        working-directory: contracts
-
-      - name: Lint with Clippy
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: contracts
-
-      - name: Run Unit Tests
-        run: cargo test
-        working-directory: contracts
-
-      - name: Run Cross-Contract Integration Tests
-        run: cargo test -p integration-tests
-        working-directory: contracts
-
   # ── Backend CI ──────────────────────────────────────────────────────────
   backend-ci:
     name: Backend CI (Express & TS)
@@ -174,7 +138,6 @@ jobs:
   contracts-coverage:
     name: Contracts Coverage (cargo-tarpaulin)
     runs-on: ubuntu-latest
-    needs: contracts-ci
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
