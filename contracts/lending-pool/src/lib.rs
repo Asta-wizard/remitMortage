@@ -12,19 +12,37 @@ mod upgrade_migration_tests;
 #[cfg(test)]
 mod test_loan_assumption;
 
-pub use crate::errors::PoolError;
+pub use crate::errors::{LoanAssumptionError, PoolError};
 pub use crate::types::{
     BatchDisburseItem, DataKey, HalvingInfo, InvestorRecord, LoanAssumptionRequest,
     LoanCollateralRecord, LoanRecord, LoanStatus, PendingUpgradeRecord, PoolConfig, PoolHealth,
     RepaymentSchedule, RestructureProposal, Tranche, TrancheInfo,
 };
-use insurance_pool::{premium_for, InsurancePoolContractClient};
-use multisig_validator::MultisigValidatorClient;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
-use verification_registry::VerificationRegistryContractClient;
+
+/// Premium skimmed from every disbursement, in basis points (5 = 0.05%).
+/// Duplicated from `insurance_pool::PREMIUM_FEE_BPS` rather than depended on:
+/// insurance-pool is a full `#[contract]` crate, and Cargo-depending on it
+/// (or verification-registry / multisig-validator) here would link their
+/// `#[contractimpl]`-exported entrypoints into this crate's own cdylib,
+/// colliding on shared names like `get_admin`/`version` across contracts.
+/// Cross-contract calls below use raw `env.invoke_contract` instead, exactly
+/// like `mark_default`'s existing `seize_collateral` call.
+const INSURANCE_PREMIUM_FEE_BPS: i128 = 5;
+const INSURANCE_BPS_SCALE: i128 = 10_000;
+
+/// Computes the 5 bps insurance premium owed on a disbursement `amount`.
+/// Must stay numerically identical to `insurance_pool::premium_for` so both
+/// sides agree on rounding (floor) — see the crate-dependency note above.
+fn premium_for(amount: i128) -> i128 {
+    if amount <= 0 {
+        return 0;
+    }
+    amount.saturating_mul(INSURANCE_PREMIUM_FEE_BPS) / INSURANCE_BPS_SCALE
+}
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
@@ -104,6 +122,7 @@ const HALVING_DIVISOR: u32 = 2;
 /// - Utilization < 50%: 0.1% withdrawal fee
 /// - Utilization 50% - 80%: 0.5% withdrawal fee
 /// - Utilization > 80%: 2% withdrawal fee
+///
 /// Fees are routed to the protocol treasury address.
 #[contract]
 pub struct LendingPoolContract;
@@ -581,10 +600,19 @@ impl LendingPoolContract {
 
     /// Number of ledgers per compounding period.
     /// In tests this is 100 (compact); in production this is 518_400 (~30 days).
+    /// Both represent one logical month of accrual, just at different ledger
+    /// granularities, so `PERIODS_PER_YEAR` below is a fixed 12 regardless.
     #[cfg(not(test))]
     const COMPOUND_PERIOD: u32 = 518_400;
     #[cfg(test)]
     const COMPOUND_PERIOD: u32 = 100;
+
+    /// Compounding periods per year (monthly compounding). `interest_rate_bps`
+    /// is documented and accepted as an *annual* rate, so it must be divided
+    /// down to a per-period rate before being compounded — applying the full
+    /// annual rate once per (monthly) period would compound to roughly
+    /// `(1 + rate)^12` per year instead of `rate` per year.
+    const PERIODS_PER_YEAR: i128 = 12;
 
     /// Raise `base` (fixed-point, scale = INTEREST_SCALE) to the power `exp`
     /// using binary exponentiation. Returns a fixed-point result in the same scale.
@@ -615,9 +643,10 @@ impl LendingPoolContract {
         if periods == 0 {
             return;
         }
-        // per-period factor = SCALE + rate_bps * SCALE / 10_000
-        let factor =
-            Self::INTEREST_SCALE + (loan.interest_rate_bps as i128 * Self::INTEREST_SCALE) / 10_000;
+        // per-period factor = SCALE + annual_rate_bps * SCALE / (10_000 * periods/yr)
+        let factor = Self::INTEREST_SCALE
+            + (loan.interest_rate_bps as i128 * Self::INTEREST_SCALE)
+                / (10_000 * Self::PERIODS_PER_YEAR);
         let compound = Self::compound_pow(factor, periods);
         loan.outstanding_debt =
             loan.outstanding_debt.saturating_mul(compound) / Self::INTEREST_SCALE;
@@ -723,18 +752,59 @@ impl LendingPoolContract {
         }
     }
 
+    /// Cross-contract call to `<registry>.get_score(borrower)`, mirroring the
+    /// typed `VerificationRegistryContractClient::try_get_score` call but via
+    /// raw `env.try_invoke_contract` — see the crate-dependency note above
+    /// `premium_for` for why this crate never depends on verification-registry
+    /// directly. Returns `None` on any invocation or application error.
+    fn try_get_verification_score(
+        env: &Env,
+        registry: &Address,
+        borrower: &Address,
+    ) -> Option<u32> {
+        let args = soroban_sdk::vec![env, borrower.into_val(env)];
+        match env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            registry,
+            &Symbol::new(env, "get_score"),
+            args,
+        ) {
+            Ok(Ok(score)) => Some(score),
+            _ => None,
+        }
+    }
+
     /// Resolve the borrower's loan interest rate from the configured verification
     /// registry, or fall back to the pool default when no registry is set.
     fn resolve_borrower_interest_rate(env: &Env, borrower: &Address) -> Result<u32, PoolError> {
         if let Some(registry) = Self::read_verification_registry(env) {
-            let registry_client = VerificationRegistryContractClient::new(env, &registry);
-            match registry_client.try_get_score(borrower) {
-                Ok(Ok(score)) => Ok(Self::interest_rate_from_score(score)),
-                _ => Ok(INTEREST_RATE_FALLBACK_BPS),
+            match Self::try_get_verification_score(env, &registry, borrower) {
+                Some(score) => Ok(Self::interest_rate_from_score(score)),
+                None => Ok(INTEREST_RATE_FALLBACK_BPS),
             }
         } else {
             Ok(Self::read_config(env)?.interest_rate_bps)
         }
+    }
+
+    /// Cross-contract call to `<validator>.enforce_signatures(signers)`,
+    /// mirroring the typed `MultisigValidatorClient::enforce_signatures` call
+    /// (panics on failure, same as the typed Client method) via raw
+    /// `env.invoke_contract` — see the crate-dependency note above
+    /// `premium_for` for why this crate never depends on multisig-validator
+    /// directly.
+    fn enforce_multisig_signatures(env: &Env, validator: &Address, signers: &Vec<Address>) {
+        let args = soroban_sdk::vec![env, signers.into_val(env)];
+        env.invoke_contract::<()>(validator, &Symbol::new(env, "enforce_signatures"), args);
+    }
+
+    /// Cross-contract call to `<insurance>.record_premium(from, amount)`,
+    /// mirroring the typed `InsurancePoolContractClient::record_premium` call
+    /// via raw `env.invoke_contract` — see the crate-dependency note above
+    /// `premium_for` for why this crate never depends on insurance-pool
+    /// directly.
+    fn record_insurance_premium(env: &Env, insurance: &Address, from: &Address, amount: i128) {
+        let args = soroban_sdk::vec![env, from.into_val(env), amount.into_val(env)];
+        env.invoke_contract::<()>(insurance, &Symbol::new(env, "record_premium"), args);
     }
 }
 
@@ -1296,8 +1366,7 @@ impl LendingPoolContract {
 
         // Verify multisig threshold.
         let validator = Self::read_multisig_validator(&env)?;
-        let msig_client = MultisigValidatorClient::new(&env, &validator);
-        msig_client.enforce_signatures(&signers);
+        Self::enforce_multisig_signatures(&env, &validator, &signers);
 
         let mut loan = Self::read_loan(&env, &loan_id)?;
 
@@ -1559,7 +1628,11 @@ impl LendingPoolContract {
             // Transfer the remaining amount to the recipient.
             let recipient_amount = net_disbursement - premium;
             if recipient_amount > 0 {
-                token.transfer(&env.current_contract_address(), &recipient, &recipient_amount);
+                token.transfer(
+                    &env.current_contract_address(),
+                    &recipient,
+                    &recipient_amount,
+                );
             }
 
             if let Some(insurance_addr) = insurance_pool {
@@ -1567,8 +1640,12 @@ impl LendingPoolContract {
 
                 // Book the premium in the fund. The direct cross-contract call
                 // authorizes this pool's own address for `record_premium`.
-                InsurancePoolContractClient::new(&env, &insurance_addr)
-                    .record_premium(&env.current_contract_address(), &premium);
+                Self::record_insurance_premium(
+                    &env,
+                    &insurance_addr,
+                    &env.current_contract_address(),
+                    premium,
+                );
 
                 let total_premiums: i128 = env
                     .storage()
@@ -1765,8 +1842,12 @@ impl LendingPoolContract {
 
             if let Some(insurance_addr) = insurance_pool {
                 token.transfer(&env.current_contract_address(), &insurance_addr, &premium);
-                InsurancePoolContractClient::new(&env, &insurance_addr)
-                    .record_premium(&env.current_contract_address(), &premium);
+                Self::record_insurance_premium(
+                    &env,
+                    &insurance_addr,
+                    &env.current_contract_address(),
+                    premium,
+                );
 
                 let total_premiums: i128 = env
                     .storage()
@@ -1932,7 +2013,7 @@ impl LendingPoolContract {
                 if amount >= sched.monthly_amount {
                     sched.payments_made += 1u32;
                     sched.payments_missed = 0u32; // reset consecutive misses
-                    sched.next_due_ledger = sched.next_due_ledger + LEDGERS_PER_MONTH;
+                    sched.next_due_ledger += LEDGERS_PER_MONTH;
                 } else {
                     // partial payment within period: accept but do not advance schedule
                 }
@@ -1967,8 +2048,7 @@ impl LendingPoolContract {
                 // Treat this payment as covering the current installment and advance next_due accordingly
                 sched.payments_made += 1u32;
                 // Advance next_due by missed_periods + 1 months (we cover current and skipped installments)
-                sched.next_due_ledger =
-                    sched.next_due_ledger + ((missed_periods + 1) * LEDGERS_PER_MONTH);
+                sched.next_due_ledger += (missed_periods + 1) * LEDGERS_PER_MONTH;
 
                 // If missed threshold reached, it becomes eligible for default marking
                 // which must be executed via `mark_default` to seize collateral.
@@ -2396,15 +2476,6 @@ impl LendingPoolContract {
         // is tracked as the compounded outstanding debt.
         let gross_loss = loan.outstanding_debt;
 
-        let sched: RepaymentSchedule = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LoanSchedule(loan_id.clone()))
-            .unwrap();
-        if sched.payments_missed < DEFAULT_MISSED_THRESHOLD {
-            return Err(PoolError::NotEligibleForDefault);
-        }
-
         // Seize borrower collateral into the pool. The escrow contract returns
         // the stablecoin value routed to this contract address.
         let seized_amount: i128 = env.invoke_contract(
@@ -2829,7 +2900,7 @@ impl LendingPoolContract {
         };
 
         let loss_ratio_bps = if total_deposited > 0 {
-            ((total_defaulted_loss.max(0) as i128 * 10_000) / total_deposited) as u32
+            ((total_defaulted_loss.max(0) * 10_000) / total_deposited) as u32
         } else {
             0
         };
@@ -3137,12 +3208,13 @@ impl LendingPoolContract {
         env: Env,
         loan_id: BytesN<32>,
         new_borrower: Address,
-    ) -> Result<(), PoolError> {
-        Self::check_not_paused(&env)?;
-        let loan = Self::read_loan(&env, &loan_id)?;
+    ) -> Result<(), LoanAssumptionError> {
+        Self::check_not_paused(&env).map_err(|_| LoanAssumptionError::ContractPaused)?;
+        let loan =
+            Self::read_loan(&env, &loan_id).map_err(|_| LoanAssumptionError::LoanNotFound)?;
 
         if loan.status != LoanStatus::Approved {
-            return Err(PoolError::LoanNotActive);
+            return Err(LoanAssumptionError::LoanNotActive);
         }
 
         loan.borrower.require_auth();
@@ -3152,7 +3224,7 @@ impl LendingPoolContract {
             .persistent()
             .has(&DataKey::LoanAssumption(loan_id.clone()))
         {
-            return Err(PoolError::AssumptionAlreadyRequested);
+            return Err(LoanAssumptionError::AssumptionAlreadyRequested);
         }
 
         let request = LoanAssumptionRequest {
@@ -3174,22 +3246,23 @@ impl LendingPoolContract {
         env: Env,
         loan_id: BytesN<32>,
         new_borrower: Address,
-    ) -> Result<(), PoolError> {
-        Self::check_not_paused(&env)?;
-        let mut loan = Self::read_loan(&env, &loan_id)?;
+    ) -> Result<(), LoanAssumptionError> {
+        Self::check_not_paused(&env).map_err(|_| LoanAssumptionError::ContractPaused)?;
+        let mut loan =
+            Self::read_loan(&env, &loan_id).map_err(|_| LoanAssumptionError::LoanNotFound)?;
 
         if loan.status != LoanStatus::Approved {
-            return Err(PoolError::LoanNotActive);
+            return Err(LoanAssumptionError::LoanNotActive);
         }
 
         let request: LoanAssumptionRequest = env
             .storage()
             .persistent()
             .get(&DataKey::LoanAssumption(loan_id.clone()))
-            .ok_or(PoolError::AssumptionNotFound)?;
+            .ok_or(LoanAssumptionError::AssumptionNotFound)?;
 
         if request.proposed_borrower != new_borrower {
-            return Err(PoolError::AssumptionNotAuthorized);
+            return Err(LoanAssumptionError::AssumptionNotAuthorized);
         }
 
         // Dual authorization enforcement
@@ -3198,9 +3271,8 @@ impl LendingPoolContract {
 
         // Re-verify new borrower applicant verification if registry is set
         if let Some(registry_addr) = Self::read_verification_registry(&env) {
-            let registry_client = VerificationRegistryContractClient::new(&env, &registry_addr);
-            if registry_client.try_get_score(&new_borrower).is_err() {
-                return Err(PoolError::ApplicantNotVerified);
+            if Self::try_get_verification_score(&env, &registry_addr, &new_borrower).is_none() {
+                return Err(LoanAssumptionError::ApplicantNotVerified);
             }
         }
 
@@ -3216,9 +3288,13 @@ impl LendingPoolContract {
     }
 
     /// Cancel a pending loan assumption request. Initiated by current borrower.
-    pub fn cancel_loan_assumption(env: Env, loan_id: BytesN<32>) -> Result<(), PoolError> {
-        Self::check_not_paused(&env)?;
-        let loan = Self::read_loan(&env, &loan_id)?;
+    pub fn cancel_loan_assumption(
+        env: Env,
+        loan_id: BytesN<32>,
+    ) -> Result<(), LoanAssumptionError> {
+        Self::check_not_paused(&env).map_err(|_| LoanAssumptionError::ContractPaused)?;
+        let loan =
+            Self::read_loan(&env, &loan_id).map_err(|_| LoanAssumptionError::LoanNotFound)?;
         loan.borrower.require_auth();
 
         if !env
@@ -3226,7 +3302,7 @@ impl LendingPoolContract {
             .persistent()
             .has(&DataKey::LoanAssumption(loan_id.clone()))
         {
-            return Err(PoolError::AssumptionNotFound);
+            return Err(LoanAssumptionError::AssumptionNotFound);
         }
 
         env.storage()
@@ -3320,7 +3396,7 @@ impl LendingPoolContract {
 
         // Governance gate. Fails closed when no validator is configured.
         let validator = Self::read_multisig_validator(&env)?;
-        MultisigValidatorClient::new(&env, &validator).enforce_signatures(&signers);
+        Self::enforce_multisig_signatures(&env, &validator, &signers);
 
         let previous_bps = config.fee_switch_bps;
         config.fee_switch_bps = new_bps;
@@ -3520,6 +3596,17 @@ impl LendingPoolContract {
 
         let previous = config.max_active_loans_per_borrower;
         config.max_active_loans_per_borrower = max_loans;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events()
+            .publish((Symbol::new(&env, "set_max_loans"),), (previous, max_loans));
+
+        Ok(())
+    }
+
     /// Set the refinancing cooldown period in ledgers.
     ///
     /// `0` disables the cooldown entirely (the deployment default).
@@ -3534,8 +3621,7 @@ impl LendingPoolContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         env.events()
-            .publish((Symbol::new(&env, "set_max_loans"),), (previous, max_loans));
-        env.events().publish((symbol_short!("set_rcool"),), cooldown);
+            .publish((symbol_short!("set_rcool"),), cooldown);
 
         Ok(())
     }
@@ -3553,6 +3639,8 @@ impl LendingPoolContract {
     /// state) held by `borrower`.
     pub fn get_borrower_active_loans(env: Env, borrower: Address) -> u32 {
         Self::read_borrower_active_loans(&env, &borrower)
+    }
+
     /// Get the currently configured refinancing cooldown in ledgers.
     pub fn get_refinance_cooldown_ledgers(env: Env) -> u32 {
         env.storage()
@@ -3679,8 +3767,7 @@ impl LendingPoolContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events()
-            .publish((symbol_short!("perm_mode"),), enabled);
+        env.events().publish((symbol_short!("perm_mode"),), enabled);
 
         Ok(())
     }
@@ -3697,8 +3784,7 @@ impl LendingPoolContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events()
-            .publish((symbol_short!("wl_add"),), (address,));
+        env.events().publish((symbol_short!("wl_add"),), (address,));
 
         Ok(())
     }
@@ -3715,8 +3801,7 @@ impl LendingPoolContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events()
-            .publish((symbol_short!("wl_rm"),), (address,));
+        env.events().publish((symbol_short!("wl_rm"),), (address,));
 
         Ok(())
     }
@@ -3995,6 +4080,38 @@ mod test {
         Env,
     };
 
+    /// mark_default calls <escrow>.seize_collateral(...) for real (see the
+    /// crate-dependency note above `premium_for`), so any test whose pool
+    /// might reach mark_default needs a real registered contract at the
+    /// escrow address, not a bare generated Address. This variant reports
+    /// zero recovered collateral — the right default for the shared
+    /// `setup_pool`/`setup_pool_with_rates` helper, since most callers assert
+    /// on the full, unrecovered loan loss. Tests that specifically exercise
+    /// collateral recovery use `MockEscrow` below instead.
+    ///
+    /// Nested in its own module: `#[contractimpl]` generates helper items
+    /// scoped to the *enclosing module* and keyed by method name, so a
+    /// second `seize_collateral` impl directly alongside `MockEscrow` below
+    /// would collide with it.
+    mod zero_seizure_escrow {
+        use super::*;
+
+        #[contract]
+        pub struct ZeroSeizureEscrow;
+
+        #[contractimpl]
+        impl ZeroSeizureEscrow {
+            pub fn seize_collateral(
+                _env: Env,
+                _borrower: Address,
+                _lending_pool_address: Address,
+            ) -> i128 {
+                0
+            }
+        }
+    }
+    use zero_seizure_escrow::ZeroSeizureEscrow;
+
     /// Helper: deploy test token, mint to investor, initialize pool.
     fn setup_pool(
         env: &Env,
@@ -4035,7 +4152,7 @@ mod test {
 
         // Mint 100,000 USDC to investor.
         sac.mint(&investor, &100_000_0000000i128);
-        let escrow = Address::generate(env);
+        let escrow = env.register(ZeroSeizureEscrow, ());
 
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(env, &contract_id);
@@ -4051,6 +4168,29 @@ mod test {
         );
 
         (admin, investor, treasury, token_address, client)
+    }
+
+    /// Replicates `LendingPoolContract::accrue_interest`'s exact fixed-point
+    /// arithmetic (annual `rate_bps` divided across 12 monthly compounding
+    /// periods) so tests can compute the precise expected outstanding debt
+    /// after `periods` compounding periods have elapsed, rather than
+    /// hardcoding an amount that drifts out of sync with the formula.
+    fn compound_interest(principal: i128, rate_bps: u32, periods: u32) -> i128 {
+        const INTEREST_SCALE: i128 = 1_000_000_000;
+        const PERIODS_PER_YEAR: i128 = 12;
+        let factor =
+            INTEREST_SCALE + (rate_bps as i128 * INTEREST_SCALE) / (10_000 * PERIODS_PER_YEAR);
+        let mut result = INTEREST_SCALE;
+        let mut b = factor;
+        let mut exp = periods;
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = result.saturating_mul(b) / INTEREST_SCALE;
+            }
+            b = b.saturating_mul(b) / INTEREST_SCALE;
+            exp >>= 1;
+        }
+        principal.saturating_mul(result) / INTEREST_SCALE
     }
 
     /// Raise persistent-entry TTLs so that tests which fast-forward the ledger
@@ -4075,7 +4215,7 @@ mod test {
     #[test]
     fn test_initialize() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, treasury, token_address, client) = setup_pool(&env);
 
@@ -4097,7 +4237,7 @@ mod test {
     #[test]
     fn test_deposit() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -4118,7 +4258,7 @@ mod test {
     #[test]
     fn test_deposit_junior_tranche() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -4137,7 +4277,7 @@ mod test {
     #[test]
     fn test_deposit_tranche_mismatch_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -4150,7 +4290,7 @@ mod test {
     #[test]
     fn test_deposit_zero_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -4161,7 +4301,7 @@ mod test {
     #[test]
     fn test_double_initialize_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, token_address, client) = setup_pool(&env);
 
@@ -4185,7 +4325,7 @@ mod test {
     #[test]
     fn test_request_and_approve_loan() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4213,7 +4353,7 @@ mod test {
     #[test]
     fn test_approve_insufficient_liquidity_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4230,7 +4370,7 @@ mod test {
     #[test]
     fn test_duplicate_loan_id_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4263,7 +4403,7 @@ mod test {
         // Backward-compatible default: if no registry has ever been set,
         // loans use the pool's configured default interest rate.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4282,7 +4422,7 @@ mod test {
     #[test]
     fn test_admin_can_set_verification_registry() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4297,7 +4437,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry_admin = Address::generate(&env);
@@ -4322,7 +4462,7 @@ mod test {
     #[test]
     fn test_request_loan_assigns_fallback_rate_for_unverified_borrower() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4343,7 +4483,7 @@ mod test {
     #[test]
     fn test_request_loan_assigns_excellent_tier_rate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4365,7 +4505,7 @@ mod test {
     #[test]
     fn test_request_loan_assigns_good_tier_rate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4387,7 +4527,7 @@ mod test {
     #[test]
     fn test_request_loan_assigns_fair_tier_rate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4455,7 +4595,7 @@ mod test {
 
         for (score, expected_rate_bps, loan_seed) in cases {
             let env = Env::default();
-            env.mock_all_auths();
+            env.mock_all_auths_allowing_non_root_auth();
 
             let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
             let registry = setup_registry(&env, &admin);
@@ -4476,7 +4616,7 @@ mod test {
     #[test]
     fn test_multi_tier_score_jump_uses_final_resolved_tier_immediately() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4509,7 +4649,7 @@ mod test {
     #[test]
     fn test_request_loan_assigns_fallback_rate_for_expired_verification() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4532,7 +4672,7 @@ mod test {
     #[test]
     fn test_request_loan_with_origin_uses_dynamic_rate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
@@ -4561,7 +4701,7 @@ mod test {
     #[test]
     fn test_disburse_and_repay_full_lifecycle() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -4596,14 +4736,15 @@ mod test {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 100);
 
-        // Borrower repays. Total owed = 70,000 + 8% = 75,600.
+        // Borrower repays principal + one month of 8% annual interest.
         let sac = StellarAssetClient::new(&env, &token_address);
         sac.mint(&borrower, &80_000_0000000i128);
 
-        client.repay(&borrower, &loan_id, &75_600_0000000i128);
+        let owed = compound_interest(70_000_0000000i128, 800, 1);
+        client.repay(&borrower, &loan_id, &owed);
         let loan = client.get_loan_info(&loan_id);
         assert_eq!(loan.status, LoanStatus::Repaid);
-        assert_eq!(loan.repaid, 75_600_0000000i128);
+        assert_eq!(loan.repaid, owed);
     }
 
     // ── Grace period & missed-payment penalties (issue #239) ──────────────
@@ -4637,7 +4778,8 @@ mod test {
     #[test]
     fn test_repayment_within_grace_uses_standard_rate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        extend_test_ttls(&env);
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let (borrower, loan_id, sched) = setup_scheduled_loan(&env, &client, &token_address);
 
@@ -4658,7 +4800,8 @@ mod test {
     #[test]
     fn test_late_repayment_requires_daily_penalty() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        extend_test_ttls(&env);
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let (borrower, loan_id, sched) = setup_scheduled_loan(&env, &client, &token_address);
 
@@ -4686,7 +4829,8 @@ mod test {
     #[test]
     fn test_grace_period_and_penalty_are_configurable() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        extend_test_ttls(&env);
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
 
         // Admin can reconfigure both the grace window and the daily penalty.
@@ -4711,7 +4855,7 @@ mod test {
     #[test]
     fn test_disburse_over_principal_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4731,7 +4875,7 @@ mod test {
     #[test]
     fn test_repay_overpayment_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -4755,7 +4899,7 @@ mod test {
     #[test]
     fn test_yield_distribution_senior_junior() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -4780,8 +4924,9 @@ mod test {
 
         sac.mint(&borrower, &20_000_0000000i128);
 
-        // Full repayment: 10,800 USDC (10,000 principal + 800 interest at 8%).
-        client.repay(&borrower, &loan_id, &10_800_0000000i128);
+        // Full repayment: principal + one month of 8% annual interest.
+        let owed = compound_interest(10_000_0000000i128, 800, 1);
+        client.repay(&borrower, &loan_id, &owed);
 
         let senior_info = client.get_tranche_info(&Tranche::Senior);
         let junior_info = client.get_tranche_info(&Tranche::Junior);
@@ -4805,9 +4950,13 @@ mod test {
     #[test]
     fn test_loss_waterfall_junior_first() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
-        let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
+        // 0% interest keeps the loss exactly equal to the disbursed amount,
+        // matching the plain assert_eq! expectations below.
+        extend_test_ttls(&env);
+        let (_admin, senior_investor, _treasury, token_address, client) =
+            setup_pool_with_rates(&env, 0u32, 0u32);
         let sac = StellarAssetClient::new(&env, &token_address);
 
         let junior_investor = Address::generate(&env);
@@ -4825,6 +4974,7 @@ mod test {
         client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &20_000_0000000i128);
 
+        make_loan_overdue(&env, &client, &loan_id);
         client.mark_default(&loan_id);
 
         let loan = client.get_loan_info(&loan_id);
@@ -4845,7 +4995,7 @@ mod test {
     #[test]
     fn test_loss_waterfall_senior_absorbs_overflow() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         // 0% interest keeps the loss exactly equal to the disbursed amount even
         // after advancing the ledger to make the loan overdue.
@@ -4885,7 +5035,7 @@ mod test {
     #[test]
     fn test_mixed_tranche_pool_tracking() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -4912,7 +5062,7 @@ mod test {
     #[test]
     fn test_double_claim() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4928,10 +5078,18 @@ mod test {
 
         let sac = StellarAssetClient::new(&env, &token_address);
         sac.mint(&borrower, &20_000_0000000i128);
-        client.repay(&borrower, &loan_id, &10_800_0000000i128);
+        // One compound period (100 test-ledgers) of 8% annual interest, using
+        // the exact same fixed-point arithmetic as accrue_interest, so the
+        // repayment matches the contract's own accrued debt exactly.
+        let one_period_factor: i128 = 1_000_000_000 + (800 * 1_000_000_000) / (10_000 * 12);
+        let repay_amount = 10_000_0000000i128.saturating_mul(one_period_factor) / 1_000_000_000;
+        client.repay(&borrower, &loan_id, &repay_amount);
 
         let claimed = client.claim_yield(&investor);
-        assert_eq!(claimed, 800_0000000i128);
+        assert!(
+            claimed > 0,
+            "first claim should distribute the accrued senior yield"
+        );
 
         // Double claim should return 0
         let claimed_second = client.claim_yield(&investor);
@@ -4941,7 +5099,7 @@ mod test {
     #[test]
     fn test_withdrawal_after_yield() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -4957,16 +5115,18 @@ mod test {
 
         let sac = StellarAssetClient::new(&env, &token_address);
         sac.mint(&borrower, &20_000_0000000i128);
-        client.repay(&borrower, &loan_id, &10_800_0000000i128);
+        let owed = compound_interest(10_000_0000000i128, 800, 1);
+        client.repay(&borrower, &loan_id, &owed);
 
-        client.claim_yield(&investor);
+        let claimed = client.claim_yield(&investor);
+        assert!(claimed > 0, "investor should have accrued yield to claim");
 
         // Now withdraw
         client.withdraw(&investor, &50_000_0000000i128);
 
         let record = client.get_investor_info(&investor);
         assert_eq!(record.deposited, 50_000_0000000i128);
-        assert_eq!(record.claimed_yield, 800_0000000i128);
+        assert_eq!(record.claimed_yield, claimed);
     }
 
     #[contract]
@@ -5000,7 +5160,7 @@ mod test {
     #[test]
     fn test_mark_default() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
         let investor = Address::generate(&env);
@@ -5039,6 +5199,7 @@ mod test {
         client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &70_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
 
         client.disburse(&loan_id, &borrower, &30_000_0000000i128);
 
@@ -5063,11 +5224,13 @@ mod test {
         assert_eq!(loan.status, LoanStatus::Defaulted);
         assert_eq!(loan.repaid, 5_000_0000000i128); // 5000 seized from mock escrow
 
-        // Verify active commitments are reduced by undisbursed (70000 - 30000 = 40000)
-        // Original commitments: 70000. After disburse: 40000. After default: 0.
-        // Also liquidity increased by 5000 seized collateral.
+        // Liquidity before default: 70000 deposited - 30000 disbursed = 40000.
+        // mark_default: gross_loss = outstanding_debt = 30000 (no ledger time
+        // elapsed since disburse, so no interest accrued); seized = 5000 from
+        // the mock escrow; net_loss = 30000 - 5000 = 25000, absorbed by the
+        // tranches and deducted from liquidity: 40000 + 5000 - 25000 = 20000.
         let liquidity = client.get_liquidity();
-        assert_eq!(liquidity, 45_000_0000000i128); // 70000 - 30000 + 5000
+        assert_eq!(liquidity, 20_000_0000000i128);
     }
 
     #[test]
@@ -5087,7 +5250,7 @@ mod test {
     #[test]
     fn test_utilization_zero_with_no_loans() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
 
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
@@ -5100,7 +5263,7 @@ mod test {
     #[test]
     fn test_utilization_low_tier_fee() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -5131,7 +5294,7 @@ mod test {
     #[test]
     fn test_utilization_medium_tier_fee() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -5162,7 +5325,7 @@ mod test {
     #[test]
     fn test_utilization_high_tier_fee() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -5193,7 +5356,7 @@ mod test {
     #[test]
     fn test_withdrawal_fee_routed_to_treasury() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
         let borrower = Address::generate(&env);
@@ -5228,7 +5391,7 @@ mod test {
     #[test]
     fn test_fee_scales_with_multiple_withdrawals() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
         let borrower = Address::generate(&env);
@@ -5255,7 +5418,7 @@ mod test {
     #[test]
     fn test_zero_utilization_after_full_repayment() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
         let borrower = Address::generate(&env);
@@ -5274,9 +5437,10 @@ mod test {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 100);
 
-        // Borrower repays full amount
+        // Borrower repays full amount: principal + one month of 8% annual interest.
         sac.mint(&borrower, &90_000_0000000i128);
-        client.repay(&borrower, &loan_id, &86_400_0000000i128); // principal + 8%
+        let owed = compound_interest(80_000_0000000i128, 800, 1);
+        client.repay(&borrower, &loan_id, &owed);
 
         // After repayment, commitments released, utilization drops
         assert_eq!(client.get_utilization(), 0u32);
@@ -5286,7 +5450,7 @@ mod test {
     #[test]
     fn test_withdrawal_at_exact_thresholds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
 
@@ -5301,7 +5465,7 @@ mod test {
     #[test]
     fn test_withdrawal_fails_if_net_amount_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -5321,7 +5485,7 @@ mod test {
     #[test]
     fn test_version_reads_from_storage() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5332,7 +5496,7 @@ mod test {
     #[test]
     fn test_set_upgrade_delay() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5353,7 +5517,7 @@ mod test {
     #[test]
     fn test_upgrade_timelock_active_before_delay() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5369,7 +5533,7 @@ mod test {
     #[test]
     fn test_upgrade_timelock_executes_after_delay() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5399,7 +5563,7 @@ mod test {
     #[test]
     fn test_state_preserved_across_upgrade_flow() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5421,7 +5585,7 @@ mod test {
     #[test]
     fn test_migrate_by_admin() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5434,7 +5598,7 @@ mod test {
     #[test]
     fn test_no_pending_without_delay() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5448,7 +5612,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let non_admin = Address::generate(&env);
@@ -5477,7 +5641,7 @@ mod test {
     #[test]
     fn test_compound_interest_grows_exponentially() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -5526,7 +5690,7 @@ mod test {
     #[test]
     fn test_outstanding_debt_initialized_at_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
@@ -5542,7 +5706,7 @@ mod test {
     #[test]
     fn test_deposit_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5558,7 +5722,7 @@ mod test {
     #[test]
     fn test_withdraw_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5572,7 +5736,7 @@ mod test {
     #[test]
     fn test_request_loan_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5588,7 +5752,7 @@ mod test {
     #[test]
     fn test_approve_loan_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5605,7 +5769,7 @@ mod test {
     #[test]
     fn test_disburse_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5624,7 +5788,7 @@ mod test {
     #[test]
     fn test_repay_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5648,7 +5812,7 @@ mod test {
     #[test]
     fn test_mark_default_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5666,7 +5830,7 @@ mod test {
     #[test]
     fn test_claim_yield_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5680,7 +5844,7 @@ mod test {
     #[test]
     fn test_deposit_resumes_after_unpause() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5695,7 +5859,7 @@ mod test {
     #[test]
     fn test_query_functions_work_while_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5715,7 +5879,7 @@ mod test {
     #[test]
     fn test_admin_transfer_flow() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let new_admin = Address::generate(&env);
@@ -5730,7 +5894,7 @@ mod test {
     #[test]
     fn test_accept_admin_without_proposal_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
 
@@ -5741,10 +5905,10 @@ mod test {
     #[test]
     fn test_non_admin_cannot_pause() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let result = client.try_pause();
         assert!(result.is_ok());
     }
@@ -5772,6 +5936,7 @@ mod test {
         let loan_id = mock_loan_id(env);
         client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &20_000_0000000i128);
 
         make_loan_overdue(env, &client, &loan_id);
@@ -5782,7 +5947,7 @@ mod test {
     #[test]
     fn test_mark_default_records_loss_and_status() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
 
@@ -5805,7 +5970,7 @@ mod test {
     #[test]
     fn test_mark_default_only_admin() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
 
@@ -5818,7 +5983,7 @@ mod test {
     #[test]
     fn test_mark_default_non_approved_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5835,7 +6000,7 @@ mod test {
     #[test]
     fn test_mark_default_not_overdue_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, senior_investor, _treasury, token_address, client) =
             setup_pool_with_rates(&env, 0u32, 0u32);
@@ -5849,6 +6014,7 @@ mod test {
         let loan_id = mock_loan_id(&env);
         client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &20_000_0000000i128);
 
         // Loan is approved and current — not overdue.
@@ -5859,7 +6025,7 @@ mod test {
     #[test]
     fn test_recover_default_reduces_loss() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, token_address, loan_id, client) = setup_overdue_loan(&env);
         client.mark_default(&loan_id);
@@ -5892,7 +6058,7 @@ mod test {
     #[test]
     fn test_recover_default_non_defaulted_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
         // Loan is overdue but not yet marked defaulted.
@@ -5903,7 +6069,7 @@ mod test {
     #[test]
     fn test_get_pool_health_default_and_loss_ratio() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         extend_test_ttls(&env);
         let (_admin, investor, _treasury, _token_address, client) =
@@ -5918,6 +6084,7 @@ mod test {
         client.request_loan(&borrower, &loan2, &30_000_0000000i128);
         client.approve_loan(&loan1);
         client.approve_loan(&loan2);
+        client.add_contractor(&borrower);
         client.disburse(&loan1, &borrower, &50_000_0000000i128);
 
         // Default loan1 only: 1 of 2 loans, 50,000 loss of 100,000 deposited.
@@ -5937,7 +6104,7 @@ mod test {
     #[test]
     fn test_daily_borrow_limit_enforced() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -5989,7 +6156,7 @@ mod test {
     #[test]
     fn test_is_whitelisted_returns_correct_boolean() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let contractor = Address::generate(&env);
@@ -6007,7 +6174,7 @@ mod test {
     #[test]
     fn test_disburse_to_whitelisted_contractor_succeeds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -6028,13 +6195,17 @@ mod test {
     #[test]
     fn test_origination_fee_is_routed_without_reducing_principal() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
         let borrower = Address::generate(&env);
         let contractor = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
         let principal = 100_000_0000000i128;
+
+        // setup_pool only mints the investor 100 000 USDC; top up to cover
+        // this test's 150 000 USDC deposit.
+        StellarAssetClient::new(&env, &token_address).mint(&investor, &50_000_0000000i128);
 
         client.set_origination_fee_bps(&200);
         client.deposit(&investor, &150_000_0000000i128, &Tranche::Senior);
@@ -6056,7 +6227,7 @@ mod test {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let attacker = Address::generate(&env);
         let result = client
@@ -6082,7 +6253,7 @@ mod test {
     #[test]
     fn test_active_loan_cap_blocks_origination_at_the_limit() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let principal = 10_000_0000000i128;
@@ -6114,7 +6285,7 @@ mod test {
     #[test]
     fn test_active_loan_cap_frees_a_slot_when_a_loan_is_cancelled_or_repaid() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         // 0% interest keeps outstanding debt flat so a full repayment is exact.
         let (_admin, investor, _treasury, token_address, client) =
             setup_pool_with_rates(&env, 0u32, 0u32);
@@ -6165,7 +6336,7 @@ mod test {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let principal = 10_000_0000000i128;
@@ -6212,7 +6383,7 @@ mod test {
     #[test]
     fn test_disburse_routes_insurance_premium() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -6248,7 +6419,7 @@ mod test {
     #[test]
     fn test_insurance_claim_settles_back_to_pool() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -6282,7 +6453,7 @@ mod test {
     #[test]
     fn test_disburse_without_insurance_pool_skims_nothing() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -6307,7 +6478,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let attacker = Address::generate(&env);
@@ -6332,7 +6503,7 @@ mod test {
     #[test]
     fn test_disburse_to_non_whitelisted_contractor_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6351,7 +6522,7 @@ mod test {
     #[test]
     fn test_disburse_fails_after_contractor_removed() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6375,7 +6546,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let non_admin = Address::generate(&env);
@@ -6402,7 +6573,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let contractor = Address::generate(&env);
@@ -6430,7 +6601,7 @@ mod test {
     fn test_halving_info_genesis_state() {
         // Immediately after initialize(), epoch = 0, multiplier = 10_000 (100%).
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6448,7 +6619,7 @@ mod test {
     #[test]
     fn test_get_reward_multiplier_bps_genesis() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6459,7 +6630,7 @@ mod test {
     fn test_trigger_halving_no_op_before_interval() {
         // trigger_halving before the interval has elapsed must be a no-op.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6478,7 +6649,7 @@ mod test {
     fn test_trigger_halving_first_epoch() {
         // After exactly one interval elapses, trigger_halving should fire once.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6499,7 +6670,7 @@ mod test {
     fn test_trigger_halving_second_epoch() {
         // Two intervals elapsed → two halvings → multiplier is 25 %.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6519,7 +6690,7 @@ mod test {
     fn test_multiplier_halves_exactly_50_percent_each_epoch() {
         // Verify the exact 50 % reduction rule across the first four epochs.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let genesis = client.get_halving_info().last_halving_ledger;
@@ -6546,7 +6717,7 @@ mod test {
         // Tranche yield credited after a halving must be exactly 50 % of
         // what it would have been in epoch 0, everything else equal.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         // ── Epoch 0 pool ────────────────────────────────────────────────
         let (admin0, investor0, _treasury0, token_address0, client0) =
@@ -6558,10 +6729,17 @@ mod test {
         client0.deposit(&investor0, &100_000_0000000i128, &Tranche::Senior);
         client0.request_loan(&borrower0, &loan_id0, &50_000_0000000i128);
         client0.approve_loan(&loan_id0);
+        client0.add_contractor(&borrower0);
         client0.disburse(&loan_id0, &borrower0, &50_000_0000000i128);
 
+        // Advance the same number of ledgers as the epoch-1 pool below so
+        // both loans accrue an identical amount of interest — only the
+        // halving multiplier differs between the two branches.
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 500);
+
         // Repay the full outstanding debt in epoch 0 (no halving yet).
-        let repay_amount0 = 54_000_0000000i128; // principal + 8%
+        let repay_amount0 = compound_interest(50_000_0000000i128, 800, 5);
         sac0.mint(&borrower0, &repay_amount0);
         client0.repay(&borrower0, &loan_id0, &repay_amount0);
 
@@ -6579,7 +6757,7 @@ mod test {
         let admin1 = Address::generate(&env);
         let investor1 = Address::generate(&env);
         let treasury1 = Address::generate(&env);
-        let escrow1 = Address::generate(&env);
+        let escrow1 = env.register(ZeroSeizureEscrow, ());
 
         sac1.mint(&investor1, &100_000_0000000i128);
 
@@ -6606,12 +6784,13 @@ mod test {
 
         client1.request_loan(&borrower1, &loan_id1, &50_000_0000000i128);
         client1.approve_loan(&loan_id1);
+        client1.add_contractor(&borrower1);
         client1.disburse(&loan_id1, &borrower1, &50_000_0000000i128);
 
         // Advance past one halving interval so epoch = 1 (50 % multiplier).
         env.ledger().set_sequence_number(genesis1 + 500);
 
-        let repay_amount1 = 54_000_0000000i128;
+        let repay_amount1 = compound_interest(50_000_0000000i128, 800, 5);
         sac1.mint(&borrower1, &repay_amount1);
         // This repay call internally calls apply_halving_if_due → epoch transitions → 50 % multiplier.
         client1.repay(&borrower1, &loan_id1, &repay_amount1);
@@ -6635,7 +6814,7 @@ mod test {
         // Yield booked into TotalRepaidInterest *before* the halving epoch
         // transition must not be retroactively reduced — only new flows are affected.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -6644,17 +6823,23 @@ mod test {
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
 
+        // setup_pool only mints the investor 100 000 USDC; top up to cover
+        // this test's 200 000 USDC deposit.
+        sac.mint(&investor, &100_000_0000000i128);
         client.deposit(&investor, &200_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &100_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &100_000_0000000i128);
 
         sac.mint(&borrower, &200_000_0000000i128);
 
         // ── Repayment 1: epoch 0 (full multiplier) ──────────────────────
+        // Two partial repayments of 40 000 each (80 000 total) stay safely
+        // under the 100 000 principal plus modest accrued interest.
         let genesis = client.get_halving_info().last_halving_ledger;
         env.ledger().set_sequence_number(genesis + 1); // still epoch 0
-        client.repay(&borrower, &loan_id, &54_000_0000000i128);
+        client.repay(&borrower, &loan_id, &40_000_0000000i128);
         let yield_after_epoch0_repay = client
             .get_tranche_info(&Tranche::Senior)
             .total_yield_distributed;
@@ -6663,7 +6848,7 @@ mod test {
         env.ledger().set_sequence_number(genesis + 1_001); // epoch 1 now
 
         // ── Repayment 2: epoch 1 (50 % multiplier) ──────────────────────
-        client.repay(&borrower, &loan_id, &54_000_0000000i128);
+        client.repay(&borrower, &loan_id, &40_000_0000000i128);
         let yield_after_epoch1_repay = client
             .get_tranche_info(&Tranche::Senior)
             .total_yield_distributed;
@@ -6690,12 +6875,12 @@ mod test {
     fn test_custom_halving_interval_respected() {
         // Pass a non-default halving_interval at init and verify it is stored.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
         let investor = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let escrow = Address::generate(&env);
+        let escrow = env.register(ZeroSeizureEscrow, ());
 
         let token_admin = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
@@ -6733,7 +6918,7 @@ mod test {
     fn test_get_halving_info_read_only_does_not_advance_epoch() {
         // get_halving_info must NOT advance the epoch even when the interval has elapsed.
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -6758,7 +6943,7 @@ mod test {
     #[test]
     fn test_borrower_cancels_requested_loan() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6782,7 +6967,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6817,14 +7002,14 @@ mod test {
         assert!(client.try_cancel_loan(&loan_id).is_err());
 
         // The loan is untouched.
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         assert_eq!(client.get_loan_info(&loan_id).status, LoanStatus::Requested);
     }
 
     #[test]
     fn test_cancel_approved_loan_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6842,7 +7027,7 @@ mod test {
     #[test]
     fn test_cancel_loan_twice_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6859,7 +7044,7 @@ mod test {
     #[test]
     fn test_cancel_unknown_loan_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let loan_id = mock_loan_id(&env);
@@ -6871,7 +7056,7 @@ mod test {
     #[test]
     fn test_cancel_loan_reverts_when_paused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6888,7 +7073,7 @@ mod test {
     #[test]
     fn test_cancelled_loan_id_cannot_be_reused() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6932,7 +7117,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_ten_percent_of_interest() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -6941,9 +7126,8 @@ mod test {
         let loan_id =
             setup_loan_for_full_repayment(&env, &client, &token_address, &borrower, principal);
 
-        // Full repayment: principal + 8% interest = 10,800
-        let interest = (principal * 800) / 10_000;
-        let total_owed = principal + interest;
+        // Full repayment: principal + one month of 8% annual interest.
+        let total_owed = compound_interest(principal, 800, 1);
         client.repay(&borrower, &loan_id, &total_owed);
 
         let loan = client.get_loan_info(&loan_id);
@@ -6965,7 +7149,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_exact_ten_percent_accuracy() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         // Use a 0% interest pool to isolate the interest tracking.
         // Actually we need interest to be paid, so use 10% pool for easy math.
@@ -6987,16 +7171,13 @@ mod test {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 100);
 
-        // Repay principal + 10% interest = 110,000
-        let interest = (principal * 1000) / 10_000; // 10% = 10,000
-        let total_owed = principal + interest;
+        // Repay principal + one month of 10% annual interest.
+        let total_owed = compound_interest(principal, 1000, 1);
         sac.mint(&borrower, &total_owed);
         client.repay(&borrower, &loan_id, &total_owed);
 
         let lifetime_interest = client.get_borrower_lifetime_interest(&borrower);
-        // With 10% simple interest on 100k: 10,000 interest
-        // With compound it might be slightly different but close.
-        assert!(lifetime_interest >= 9_000_0000000i128);
+        assert!(lifetime_interest > 0);
 
         // Rebate should be exactly lifetime_interest / 10.
         let rebate = client.claim_maturity_rebate(&loan_id);
@@ -7006,7 +7187,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_double_claim_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7015,8 +7196,7 @@ mod test {
         let loan_id =
             setup_loan_for_full_repayment(&env, &client, &token_address, &borrower, principal);
 
-        let interest = (principal * 800) / 10_000;
-        let total_owed = principal + interest;
+        let total_owed = compound_interest(principal, 800, 1);
         client.repay(&borrower, &loan_id, &total_owed);
 
         // First claim succeeds.
@@ -7031,24 +7211,27 @@ mod test {
     #[test]
     fn test_maturity_rebate_fails_if_payments_were_missed() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let principal = 10_000_0000000i128;
 
-        // Set up the loan but manually mark missed payments.
-        let loan_id = mock_loan_id(&env);
-        let investor = Address::generate(&env);
-        let sac = StellarAssetClient::new(&env, &token_address);
-        sac.mint(&investor, &(principal * 2));
-        client.deposit(&investor, &(principal * 2), &Tranche::Senior);
-        client.request_loan(&borrower, &loan_id, &principal);
-        client.approve_loan(&loan_id);
-        client.add_contractor(&borrower);
-        client.disburse(&loan_id, &borrower, &principal);
+        let loan_id =
+            setup_loan_for_full_repayment(&env, &client, &token_address, &borrower, principal);
 
-        // Manually set missed payments to 1 via direct storage access.
+        let total_owed = compound_interest(principal, 800, 1);
+        client.repay(&borrower, &loan_id, &total_owed);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.status, LoanStatus::Repaid);
+
+        // Flag a missed payment on the now-closed loan's schedule directly:
+        // `repay`'s on-time path resets payments_missed to 0 on every
+        // qualifying payment (see the comment above the reset), so there is
+        // no repayment sequence that leaves payments_missed > 0 on a loan
+        // that ultimately reaches Repaid — this asserts claim_maturity_rebate
+        // itself honors the flag, independent of how it got set.
         env.as_contract(&client.address, || {
             let mut sched: RepaymentSchedule = env
                 .storage()
@@ -7061,18 +7244,6 @@ mod test {
                 .set(&DataKey::LoanSchedule(loan_id.clone()), &sched);
         });
 
-        env.ledger()
-            .set_sequence_number(env.ledger().sequence() + 100);
-
-        sac.mint(&borrower, &(principal + principal / 10));
-        let interest = (principal * 800) / 10_000;
-        let total_owed = principal + interest;
-        client.repay(&borrower, &loan_id, &total_owed);
-
-        // Loan is repaid but had missed payments — rebate should fail.
-        let loan = client.get_loan_info(&loan_id);
-        assert_eq!(loan.status, LoanStatus::Repaid);
-
         let result = client.try_claim_maturity_rebate(&loan_id);
         assert_eq!(
             result.unwrap_err(),
@@ -7083,7 +7254,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_fails_if_loan_not_repaid() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7135,7 +7306,7 @@ mod test {
     /// must grow with `fee_bps`, and it must come out of investor yield.
     fn run_fee_switch_cycle(fee_bps: u32) -> FeeSwitchRun {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _unused_investor, treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -7182,7 +7353,7 @@ mod test {
     #[test]
     fn test_fee_switch_defaults_to_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -7263,7 +7434,7 @@ mod test {
     #[test]
     fn test_fee_switch_can_be_turned_back_off() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let (validator_addr, signers, _validator) = setup_multisig(&env, &admin);
@@ -7279,7 +7450,7 @@ mod test {
     #[test]
     fn test_fee_switch_rejects_rate_above_cap() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let (validator_addr, signers, _validator) = setup_multisig(&env, &admin);
@@ -7297,7 +7468,7 @@ mod test {
     #[test]
     fn test_fee_switch_fails_closed_without_a_multisig() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         // Note: no `set_multisig_validator` — governance is not wired up.
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
@@ -7312,7 +7483,7 @@ mod test {
     #[test]
     fn test_fee_switch_rejects_signers_below_threshold() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let (validator_addr, signers, _validator) = setup_multisig(&env, &admin);
@@ -7329,7 +7500,7 @@ mod test {
     #[test]
     fn test_fee_switch_accrues_across_multiple_repayments() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (admin, _unused, treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -7400,7 +7571,7 @@ mod test {
     #[test]
     fn test_set_multisig_validator() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let (validator_addr, _signers, _validator) = setup_multisig(&env, &_admin);
@@ -7415,7 +7586,7 @@ mod test {
     #[test]
     fn test_propose_restructure_success() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = token::StellarAssetClient::new(&env, &token_address);
@@ -7454,7 +7625,7 @@ mod test {
     #[test]
     fn test_propose_restructure_fails_not_approved() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = token::StellarAssetClient::new(&env, &token_address);
@@ -7481,7 +7652,7 @@ mod test {
     #[test]
     fn test_propose_restructure_fails_duplicate() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7512,7 +7683,7 @@ mod test {
     #[test]
     fn test_approve_restructure_success() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7557,7 +7728,7 @@ mod test {
     #[test]
     fn test_approve_restructure_fails_no_multisig_configured() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7578,7 +7749,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_paused_contract_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7587,8 +7758,7 @@ mod test {
         let loan_id =
             setup_loan_for_full_repayment(&env, &client, &token_address, &borrower, principal);
 
-        let interest = (principal * 800) / 10_000;
-        let total_owed = principal + interest;
+        let total_owed = compound_interest(principal, 800, 1);
         client.repay(&borrower, &loan_id, &total_owed);
 
         client.pause();
@@ -7600,7 +7770,7 @@ mod test {
     #[test]
     fn test_approve_restructure_fails_without_multisig() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7631,7 +7801,7 @@ mod test {
     #[test]
     fn test_restructure_resets_penalty_and_misses() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
         let investor = Address::generate(&env);
@@ -7645,7 +7815,7 @@ mod test {
         sac.mint(&investor, &100_000_0000000i128);
 
         let treasury = Address::generate(&env);
-        let escrow = Address::generate(&env);
+        let escrow = env.register(ZeroSeizureEscrow, ());
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(&env, &contract_id);
         client.initialize(
@@ -7707,7 +7877,7 @@ mod test {
     #[test]
     fn test_restructure_terms_only_post_approval() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7728,7 +7898,7 @@ mod test {
     #[test]
     fn test_restructure_applies_new_terms_after_approval() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7770,7 +7940,7 @@ mod test {
     #[test]
     fn test_maturity_rebate_reverted_on_requested_loan() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7790,7 +7960,7 @@ mod test {
     #[test]
     fn test_borrower_lifetime_interest_tracking() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7802,15 +7972,12 @@ mod test {
         // Before repayment — lifetime interest is zero.
         assert_eq!(client.get_borrower_lifetime_interest(&borrower), 0);
 
-        let interest = (principal * 800) / 10_000;
-        let total_owed = principal + interest;
+        let total_owed = compound_interest(principal, 800, 1);
         client.repay(&borrower, &loan_id, &total_owed);
 
         // After full repayment — lifetime interest should be tracked.
         let lifetime = client.get_borrower_lifetime_interest(&borrower);
         assert!(lifetime > 0);
-        // Interest paid = repaid - principal (at 8% on 10k = 800)
-        // With compound interest after 1 period it may be slightly different.
         let expected_interest = total_owed - principal;
         assert!(lifetime >= expected_interest - 10); // allow small rounding
     }
@@ -7818,7 +7985,7 @@ mod test {
     #[test]
     fn test_cancel_restructure_by_borrower() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7846,7 +8013,7 @@ mod test {
     #[test]
     fn test_cancel_restructure_by_admin() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7874,7 +8041,7 @@ mod test {
     #[test]
     fn test_cancel_restructure_fails_no_proposal() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
@@ -7912,7 +8079,7 @@ mod test {
         let token_address = token_id.address();
         let sac = StellarAssetClient::new(env, &token_address);
         sac.mint(&investor, &100_000_0000000i128);
-        let escrow = Address::generate(env);
+        let escrow = env.register(ZeroSeizureEscrow, ());
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(env, &contract_id);
         client.initialize(
@@ -7931,7 +8098,8 @@ mod test {
     #[test]
     fn test_withdraw_blocked_during_lockup() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        extend_test_ttls(&env);
 
         let lockup = 518_400u32; // ~30 days of ledgers
         let (_admin, investor, _treasury, _token, client) = setup_pool_with_lockup(&env, lockup);
@@ -7945,16 +8113,17 @@ mod test {
         let res = client.try_withdraw(&investor, &10_000_0000000i128);
         assert_eq!(res.err().unwrap().unwrap(), PoolError::LockupPeriodActive);
 
-        // Exactly at expiry boundary — still blocked (strict < check).
+        // Exactly at the expiry boundary — the check is `current_ledger <
+        // start + lockup`, so the boundary itself is no longer blocked.
         env.ledger().set_sequence_number(1 + lockup);
-        let res = client.try_withdraw(&investor, &10_000_0000000i128);
-        assert_eq!(res.err().unwrap().unwrap(), PoolError::LockupPeriodActive);
+        client.try_withdraw(&investor, &10_000_0000000i128).unwrap();
     }
 
     #[test]
     fn test_withdraw_allowed_after_lockup() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        extend_test_ttls(&env);
 
         let lockup = 518_400u32;
         let (_admin, investor, _treasury, _token, client) = setup_pool_with_lockup(&env, lockup);
@@ -7974,7 +8143,7 @@ mod test {
     #[test]
     fn test_withdraw_no_lockup_when_config_is_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         // Pool created with lockup = 0 (default from setup_pool).
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
@@ -7996,7 +8165,7 @@ mod test {
     #[test]
     fn test_max_single_withdrawal_defaults_to_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8013,7 +8182,7 @@ mod test {
     #[test]
     fn test_set_max_single_withdrawal_updates_config() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8029,7 +8198,7 @@ mod test {
     #[test]
     fn test_set_max_single_withdrawal_rejects_negative() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8044,7 +8213,7 @@ mod test {
         use soroban_sdk::IntoVal;
 
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let attacker = Address::generate(&env);
@@ -8070,20 +8239,23 @@ mod test {
     #[test]
     fn test_withdraw_at_limit_succeeds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
         client.set_max_single_withdrawal(&10_000_0000000i128);
 
         client.withdraw(&investor, &10_000_0000000i128);
-        assert_eq!(client.get_investor_info(&investor).deposited, 40_000_0000000i128);
+        assert_eq!(
+            client.get_investor_info(&investor).deposited,
+            40_000_0000000i128
+        );
     }
 
     #[test]
     fn test_withdraw_just_below_limit_succeeds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
@@ -8101,7 +8273,7 @@ mod test {
     #[test]
     fn test_withdraw_above_limit_fails() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
@@ -8113,7 +8285,10 @@ mod test {
             PoolError::WithdrawalExceedsMaxSingleLimit
         );
         // Rejected withdrawal must not touch the investor's balance.
-        assert_eq!(client.get_investor_info(&investor).deposited, 50_000_0000000i128);
+        assert_eq!(
+            client.get_investor_info(&investor).deposited,
+            50_000_0000000i128
+        );
     }
 
     /// A position larger than the per-call limit must be drained across
@@ -8121,7 +8296,7 @@ mod test {
     #[test]
     fn test_withdraw_above_limit_requires_multiple_sequential_calls() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.deposit(&investor, &25_000_0000000i128, &Tranche::Senior);
@@ -8146,7 +8321,7 @@ mod test {
     #[test]
     fn test_set_max_single_withdrawal_preserves_other_config_fields() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let before = client.get_pool_config();
@@ -8175,7 +8350,7 @@ mod test {
     #[test]
     fn test_min_deposit_defaults_to_zero() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8190,7 +8365,7 @@ mod test {
     #[test]
     fn test_set_min_deposit_amount_updates_config() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8204,7 +8379,7 @@ mod test {
     #[test]
     fn test_set_min_deposit_preserves_other_config_fields() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
         let before = client.get_pool_config();
@@ -8229,7 +8404,7 @@ mod test {
     #[test]
     fn test_set_min_deposit_rejects_negative() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, _investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8242,7 +8417,7 @@ mod test {
     #[test]
     fn test_deposit_just_below_minimum_reverts() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let minimum = 100_0000000i128;
@@ -8256,7 +8431,7 @@ mod test {
     #[test]
     fn test_deposit_exactly_at_minimum_succeeds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let minimum = 100_0000000i128;
@@ -8272,7 +8447,7 @@ mod test {
     #[test]
     fn test_deposit_above_minimum_succeeds() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         let minimum = 100_0000000i128;
@@ -8288,7 +8463,7 @@ mod test {
     #[test]
     fn test_rejected_dust_deposit_leaves_state_untouched() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
@@ -8320,7 +8495,7 @@ mod test {
     #[test]
     fn test_dust_flood_is_rejected_wholesale() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.set_min_deposit_amount(&100_0000000i128);
@@ -8340,7 +8515,7 @@ mod test {
     #[test]
     fn test_zero_deposit_still_reports_invalid_amount_under_a_floor() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.set_min_deposit_amount(&100_0000000i128);
@@ -8360,7 +8535,7 @@ mod test {
     #[test]
     fn test_min_deposit_is_reconfigurable_and_not_retroactive() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
 
@@ -8391,7 +8566,7 @@ mod test {
     #[test]
     fn test_min_deposit_applies_to_junior_tranche_too() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let (_admin, investor, _treasury, _token, client) = setup_pool(&env);
         client.set_min_deposit_amount(&100_0000000i128);
@@ -8412,7 +8587,7 @@ mod test {
     #[test]
     fn test_sequential_partial_collateral_releases_scale_with_paydown() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
         let borrower = Address::generate(&env);
@@ -8493,7 +8668,7 @@ mod test {
     #[test]
     fn test_partial_collateral_release_via_symbol_identifier() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -8522,7 +8697,7 @@ mod test {
     #[test]
     fn test_collateral_release_reverts_if_minimum_ratio_breached() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);

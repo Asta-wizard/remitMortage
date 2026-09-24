@@ -12,7 +12,10 @@ fn key(env: &Env, b: u8) -> BytesN<32> {
 }
 
 fn signer(env: &Env, b: u8, weight: u32) -> Signer {
-    Signer { key: key(env, b), weight }
+    Signer {
+        key: key(env, b),
+        weight,
+    }
 }
 
 /// Register a 3-signer account with weights {A:2, B:1, C:1} and threshold 3.
@@ -62,8 +65,7 @@ fn test_exceeds_threshold() {
     let (account, client) = setup(&env);
 
     // A(2) + B(1) + C(1) = 4 > 3.
-    let keys: Vec<BytesN<32>> =
-        vec![&env, key(&env, 0xA1), key(&env, 0xB2), key(&env, 0xC3)];
+    let keys: Vec<BytesN<32>> = vec![&env, key(&env, 0xA1), key(&env, 0xB2), key(&env, 0xC3)];
     assert_eq!(client.tally_weight(&account, &keys), 4u32);
     assert!(client.verify_threshold(&account, &keys));
 }
@@ -549,8 +551,7 @@ fn test_verify_signatures_meets_threshold() {
     let env = Env::default();
     env.mock_all_auths();
     let (_admin, signers, client) = setup_admin(&env);
-    let presented: Vec<Address> =
-        vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
+    let presented: Vec<Address> = vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
     assert_eq!(client.count_valid_signers(&presented), 2u32);
     assert!(client.verify_signatures(&presented));
     client.enforce_signatures(&presented); // does not panic
@@ -575,8 +576,8 @@ fn test_count_valid_signers_ignores_duplicates_and_unknowns() {
     let presented: Vec<Address> = vec![
         &env,
         signers.get_unchecked(0),
-        signers.get_unchecked(0),   // duplicate -> counted once
-        Address::generate(&env),    // unknown -> ignored
+        signers.get_unchecked(0), // duplicate -> counted once
+        Address::generate(&env),  // unknown -> ignored
     ];
     assert_eq!(client.count_valid_signers(&presented), 1u32);
 }
@@ -586,11 +587,11 @@ fn test_set_quorum_threshold_success() {
     let env = Env::default();
     env.mock_all_auths();
     let (_admin, _signers, client) = setup_admin(&env);
-    
+
     // Initial config has threshold 2 with 3 signers
     let config = client.get_signer_config();
     assert_eq!(config.threshold, 2u32);
-    
+
     // Update threshold to 3
     client.set_quorum_threshold(&3u32);
     let updated = client.get_signer_config();
@@ -602,13 +603,12 @@ fn test_set_quorum_threshold_blocks_below_threshold() {
     let env = Env::default();
     env.mock_all_auths();
     let (_admin, signers, client) = setup_admin(&env);
-    
+
     // Set threshold to 3 (max with 3 signers)
     client.set_quorum_threshold(&3u32);
-    
+
     // Try to present only 2 signatures -> should fail
-    let presented: Vec<Address> =
-        vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
+    let presented: Vec<Address> = vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
     assert!(!client.verify_signatures(&presented));
 }
 
@@ -635,18 +635,24 @@ fn test_quorum_threshold_update_enforces_new_requirement() {
     let env = Env::default();
     env.mock_all_auths();
     let (_admin, signers, client) = setup_admin(&env);
-    
+
     // Initial: 2-of-3 signers, 2 signatures should pass
-    let two_sigs: Vec<Address> =
-        vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
+    let two_sigs: Vec<Address> = vec![&env, signers.get_unchecked(0), signers.get_unchecked(1)];
     assert!(client.verify_signatures(&two_sigs));
-    
-    // Same 2 signatures should now fail
+
+    // Raise the quorum threshold to require all 3 signers.
+    client.set_quorum_threshold(&3u32);
+
+    // Same 2 signatures should now fail under the new, stricter threshold.
     assert!(!client.verify_signatures(&two_sigs));
-    
+
     // But all 3 should pass
-    let three_sigs: Vec<Address> =
-        vec![&env, signers.get_unchecked(0), signers.get_unchecked(1), signers.get_unchecked(2)];
+    let three_sigs: Vec<Address> = vec![
+        &env,
+        signers.get_unchecked(0),
+        signers.get_unchecked(1),
+        signers.get_unchecked(2),
+    ];
     assert!(client.verify_signatures(&three_sigs));
 }
 
@@ -702,7 +708,8 @@ fn test_duplicate_admin_signer_ignored_in_count() {
     let (_admin, signers, client) = setup_admin(&env); // 2-of-3 threshold
 
     // Presenting duplicate signer S0 twice: counted only once (count = 1 < 2)
-    let dup_presented: Vec<Address> = vec![&env, signers.get_unchecked(0), signers.get_unchecked(0)];
+    let dup_presented: Vec<Address> =
+        vec![&env, signers.get_unchecked(0), signers.get_unchecked(0)];
     assert_eq!(client.count_valid_signers(&dup_presented), 1u32);
     assert!(!client.verify_signatures(&dup_presented));
 
@@ -760,7 +767,7 @@ fn test_proposal_expiry_blocks_partially_signed_proposal_approval() {
 
     // Submit proposal expiring at ledger 100
     client.submit_action(&pid, &100u32);
-    env.ledger().set_sequence(50);
+    env.ledger().set_sequence_number(50);
 
     // Partially-signed: weight 1 < threshold 3 fails
     let partial_keys: Vec<BytesN<32>> = vec![&env, key(&env, 0xC3)];
@@ -768,7 +775,7 @@ fn test_proposal_expiry_blocks_partially_signed_proposal_approval() {
     assert_eq!(res_partial, Err(Ok(ValidatorError::InsufficientWeight)));
 
     // Advance past expiration ledger (seq 101 > 100)
-    env.ledger().set_sequence(101);
+    env.ledger().set_sequence_number(101);
 
     // Submitting full signatures now fails with ProposalExpired
     let full_keys: Vec<BytesN<32>> = vec![&env, key(&env, 0xA1), key(&env, 0xB2)];
@@ -784,18 +791,18 @@ fn test_proposal_expiry_blocks_execution_of_locked_proposal() {
     let pid = proposal_id(&env, 0x88);
 
     // Submit proposal expiring at ledger 100
-    env.ledger().set_sequence(10);
+    env.ledger().set_sequence_number(10);
     client.submit_action(&pid, &100u32);
 
     // Approve proposal at ledger 50 -> transitions to Locked
-    env.ledger().set_sequence(50);
+    env.ledger().set_sequence_number(50);
     let full_keys: Vec<BytesN<32>> = vec![&env, key(&env, 0xA1), key(&env, 0xB2)];
     client.approve_action(&account, &pid, &full_keys);
     assert_eq!(client.get_proposal(&pid).state, ProposalState::Locked);
 
     // Advance timestamp so timelock elapses, but sequence passes expiration (ledger 105 > 100)
     env.ledger().set_timestamp(1_000_015);
-    env.ledger().set_sequence(105);
+    env.ledger().set_sequence_number(105);
 
     // Execution fails because the proposal expired
     let res = client.try_execute_action(&pid);
@@ -857,10 +864,8 @@ fn test_get_signer_vote_record_default() {
     env.mock_all_auths();
     let (_admin, signers, client) = setup_admin(&env);
 
-    let record = client.get_signer_vote_record(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let record =
+        client.get_signer_vote_record(&signers.get_unchecked(0), &signers.get_unchecked(1));
     assert_eq!(record.consecutive_missed, 0u32);
     assert_eq!(record.consecutive_active, 0u32);
     assert!(!record.penalized);
@@ -872,10 +877,7 @@ fn test_effective_weight_normal() {
     env.mock_all_auths();
     let (_admin, signers, client) = setup_admin(&env);
 
-    let weight = client.effective_weight(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let weight = client.effective_weight(&signers.get_unchecked(0), &signers.get_unchecked(1));
     // All signers have weight 1 in setup_admin
     assert_eq!(weight, 1u32);
 }
@@ -898,39 +900,35 @@ fn test_effective_weight_penalized() {
     client.submit_action(&pid, &0u32);
 
     // Mark it as expired
-    env.ledger().set_sequence(1001); // Past default expiry in test mode
+    env.ledger().set_sequence_number(1001); // Past default expiry in test mode
 
     // Mark missed votes for all signers
     let expired: Vec<BytesN<32>> = vec![&env, pid];
     client.mark_missed_votes(&signers.get_unchecked(0), &expired);
 
     // Check vote record
-    let record = client.get_signer_vote_record(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let record =
+        client.get_signer_vote_record(&signers.get_unchecked(0), &signers.get_unchecked(1));
     assert_eq!(record.consecutive_missed, 1u32);
     assert!(!record.penalized); // Not yet at threshold
 
     // Mark another miss
     let pid2 = proposal_id(&env, 0xBB);
     client.submit_action(&pid2, &0u32);
-    env.ledger().set_sequence(2001);
+    // pid2 is submitted at ledger 1001, so it expires at 1001 + 1000 = 2001;
+    // is_expired uses a strict `>` check, so the boundary itself (2001)
+    // does not yet count as expired.
+    env.ledger().set_sequence_number(2002);
     let expired2: Vec<BytesN<32>> = vec![&env, pid2];
     client.mark_missed_votes(&signers.get_unchecked(0), &expired2);
 
-    let record2 = client.get_signer_vote_record(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let record2 =
+        client.get_signer_vote_record(&signers.get_unchecked(0), &signers.get_unchecked(1));
     assert_eq!(record2.consecutive_missed, 2u32);
     assert!(record2.penalized); // At threshold
 
     // Effective weight should be reduced (1 * 50% = 0, but min is 1)
-    let weight = client.effective_weight(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let weight = client.effective_weight(&signers.get_unchecked(0), &signers.get_unchecked(1));
     assert_eq!(weight, 1u32); // Minimum weight is 1
 }
 
@@ -949,49 +947,50 @@ fn test_penalty_recovery_after_active_votes() {
         consecutive_active: 0,
         penalized: true,
     };
-    env.storage().persistent().set(
-        &DataKey::SignerVoteRecord(
-            signers.get_unchecked(0).clone(),
-            signers.get_unchecked(1).clone(),
-        ),
-        &record,
-    );
-
-    // Verify penalized
-    let weight_before = client.effective_weight(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
-    assert_eq!(weight_before, 1u32); // Reduced from 1, min is 1
-
-    // Simulate 3 active votes to trigger recovery
-    for _ in 0..3 {
-        let current: SignerVoteRecord = env.storage().persistent().get(
-            &DataKey::SignerVoteRecord(
-                signers.get_unchecked(0).clone(),
-                signers.get_unchecked(1).clone(),
-            ),
-        ).unwrap();
-        
-        let updated = SignerVoteRecord {
-            consecutive_missed: 0,
-            consecutive_active: current.consecutive_active + 1,
-            penalized: if current.consecutive_active + 1 >= 3 { false } else { true },
-        };
+    env.as_contract(&client.address, || {
         env.storage().persistent().set(
             &DataKey::SignerVoteRecord(
                 signers.get_unchecked(0).clone(),
                 signers.get_unchecked(1).clone(),
             ),
-            &updated,
+            &record,
         );
+    });
+
+    // Verify penalized
+    let weight_before =
+        client.effective_weight(&signers.get_unchecked(0), &signers.get_unchecked(1));
+    assert_eq!(weight_before, 1u32); // Reduced from 1, min is 1
+
+    // Simulate 3 active votes to trigger recovery
+    for _ in 0..3 {
+        env.as_contract(&client.address, || {
+            let current: SignerVoteRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SignerVoteRecord(
+                    signers.get_unchecked(0).clone(),
+                    signers.get_unchecked(1).clone(),
+                ))
+                .unwrap();
+
+            let updated = SignerVoteRecord {
+                consecutive_missed: 0,
+                consecutive_active: current.consecutive_active + 1,
+                penalized: current.consecutive_active + 1 < 3,
+            };
+            env.storage().persistent().set(
+                &DataKey::SignerVoteRecord(
+                    signers.get_unchecked(0).clone(),
+                    signers.get_unchecked(1).clone(),
+                ),
+                &updated,
+            );
+        });
     }
 
     // Verify recovery
-    let weight_after = client.effective_weight(
-        &signers.get_unchecked(0),
-        &signers.get_unchecked(1),
-    );
+    let weight_after =
+        client.effective_weight(&signers.get_unchecked(0), &signers.get_unchecked(1));
     assert_eq!(weight_after, 1u32); // Back to full weight
 }
-
