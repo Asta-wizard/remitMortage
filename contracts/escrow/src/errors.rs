@@ -52,4 +52,14 @@ pub enum EscrowError {
     EscrowGoalNotFound = 23,
     /// Address is not whitelisted when permissioned mode is enabled.
     AddressNotWhitelisted = 24,
+    /// No auto-deposit schedule is configured for this borrower/goal escrow.
+    AutoDepositNotConfigured = 34,
+    /// The auto-deposit interval has not elapsed since the last scheduled draw.
+    AutoDepositNotDue = 35,
+    /// The borrower's token allowance to the escrow is below the scheduled amount.
+    InsufficientAllowance = 36,
+    /// The borrower's token balance is below the scheduled amount.
+    InsufficientBalance = 37,
+    /// Auto-deposit interval must be greater than zero ledgers.
+    InvalidAutoDepositInterval = 38,
 }
