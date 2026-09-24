@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import loadDynamic from "next/dynamic";
 import { useTranslations } from "next-intl";
 import { useRouter } from "next/navigation";
@@ -35,6 +35,7 @@ import { arrayMove, SortableContext, sortableKeyboardCoordinates, verticalListSo
 import { useWidgetStore, WidgetId } from '../stores/useWidgetStore';
 import { SortableWidget } from '../../components/dashboard/SortableWidget';
 import { WidgetSettingsModal } from '../../components/dashboard/WidgetSettingsModal';
+import { useAutoRefresh } from '../../hooks/useAutoRefresh';
 import { track } from "../../lib/analytics";
 
 
@@ -130,7 +131,7 @@ export default function DashboardPage() {
     if (isConnected && publicKey) track("borrower_dashboard_viewed");
   }, [isConnected, publicKey]);
 
-  const { order, visibility, setOrder } = useWidgetStore();
+  const { order, visibility, setOrder, refreshInterval } = useWidgetStore();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -345,22 +346,19 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!isConnected) {
-      router.push("/");
-      return;
-    }
-
-    if (!publicKey) return;
-
-    async function load() {
-      setLoading(true);
-      setError(null);
+  const loadStatus = useCallback(
+    async ({ background = false }: { background?: boolean } = {}) => {
+      if (!publicKey) return;
+      if (!background) {
+        setLoading(true);
+        setError(null);
+      }
       try {
         const res = await fetch(`/api/borrower/${publicKey}/status`);
         if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
         const data = await res.json();
         setStatus(data);
+        setError(null);
         setMilestones(SAMPLE_MILESTONES);
         const missed = data.loan?.missedPayments ?? 0;
         setRecoveryPlan(
@@ -371,14 +369,30 @@ export default function DashboardPage() {
           })
         );
       } catch (e: any) {
-        setError(e?.message || "Failed to load borrower status");
+        // A failed background poll keeps the last good data on screen.
+        if (!background) setError(e?.message || "Failed to load borrower status");
       } finally {
-        setLoading(false);
+        if (!background) setLoading(false);
       }
+    },
+    [publicKey]
+  );
+
+  useEffect(() => {
+    if (!isConnected) {
+      router.push("/");
+      return;
+    }
+
+    async function load() {
+      await loadStatus();
     }
 
     load();
-  }, [isConnected, publicKey, router]);
+  }, [isConnected, loadStatus, router]);
+
+  const backgroundRefresh = useCallback(() => loadStatus({ background: true }), [loadStatus]);
+  useAutoRefresh(backgroundRefresh, refreshInterval, isConnected && !!publicKey);
 
   return (
     <div className="rm-app-page min-h-screen bg-[#060913] text-slate-100 pb-20">
