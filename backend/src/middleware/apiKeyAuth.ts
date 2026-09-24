@@ -30,6 +30,7 @@ export function requireScopedApiKey(requiredScope: string) {
         return;
       }
 
+      res.locals.apiKey = apiKey;
       next();
     } catch (err) {
       res.status(500).json({ error: "internal_server_error", message: "Error validating API key" });
