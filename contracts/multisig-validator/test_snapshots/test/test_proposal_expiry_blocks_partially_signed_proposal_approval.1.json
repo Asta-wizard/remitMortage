@@ -114,11 +114,12 @@
       ]
     ],
     [],
+    [],
     []
   ],
   "ledger": {
     "protocol_version": 22,
-    "sequence_number": 0,
+    "sequence_number": 101,
     "timestamp": 1000000,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -136,7 +137,7 @@
                   "symbol": "ActionProposal"
                 },
                 {
-                  "bytes": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                 }
               ]
             },
@@ -156,7 +157,7 @@
                       "symbol": "ActionProposal"
                     },
                     {
-                      "bytes": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                     }
                   ]
                 },
@@ -176,7 +177,7 @@
                         "symbol": "expiration_ledger"
                       },
                       "val": {
-                        "u32": 1000
+                        "u32": 100
                       }
                     },
                     {
