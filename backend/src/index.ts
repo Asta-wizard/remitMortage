@@ -1,3 +1,6 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import "dotenv/config";
 // Must load before any other module — OpenTelemetry auto-instrumentation
 // patches libraries (express, http, pg, etc.) at require-time.

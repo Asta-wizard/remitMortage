@@ -1,3 +1,6 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 use super::*;
 use soroban_sdk::{testutils::Address as _, vec, Env};
 
